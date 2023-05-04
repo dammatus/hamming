@@ -1,14 +1,5 @@
 package modules
 
-const (
-	bitsParity32    = 5
-	bitsParity2048  = 11
-	bitsParity65536 = 16
-	bitsInfo32      = 26
-	bitsInfo2048    = 2036
-	bitsInfo65536   = 65519
-)
-
 // Convierte de binario a texto
 func BinToASCII(bin []byte) string {
 	/*
