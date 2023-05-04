@@ -1,11 +1,23 @@
-package hamming
+package main
 
 import (
 	"fmt"
+	"io"
 	"io/ioutil"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strconv"
+	"text/template"
 
 	"github.com/dammatus/hamming/modules"
 )
+
+type Resultados struct {
+	Contenido    string
+	Codificado   string
+	Decodificado string
+}
 
 const (
 	bitsParity32    = 5
@@ -15,6 +27,8 @@ const (
 	bitsInfo2048    = 2036
 	bitsInfo65536   = 65519
 )
+
+var blockSize int
 
 // Abre el archivo a codificar
 func readFile(file string) string {
@@ -39,15 +53,80 @@ func writeFile(file string, datos string) error {
 	// Si no hay errores, devuelve nil
 	return nil
 }
+
 func main() {
 
-	var blockSize int
-	fmt.Println("Ingrese un numero entero:")
-	_, err := fmt.Scan(&blockSize)
+	// Handlers
+	http.HandleFunc("/files", controlarArchivo)
+	http.HandleFunc("/", controlarIndex)
+	http.HandleFunc("/resultados", mostrarResultados)
+
+	// Iniciar el servidor
+	fmt.Println("Servidor escuchando en http://localhost:8080")
+	http.ListenAndServe(":8080", nil)
+
+}
+
+func controlarIndex(w http.ResponseWriter, r *http.Request) {
+	if r.Method == "GET" {
+		// Si es GET, mostramos el formulario
+		http.ServeFile(w, r, "index.html")
+	} else if r.Method == "POST" {
+		// Si es POST, enviamos el archivo a la función controlarArchivo
+		controlarArchivo(w, r)
+	}
+}
+
+func controlarArchivo(w http.ResponseWriter, r *http.Request) {
+
+	// Parsea la petición y extrae el archivo subido
+	err := r.ParseMultipartForm(10 << 20) // 10 MB
 	if err != nil {
-		fmt.Println("Error al leer el numero:", err)
+		http.Error(w, "Error al procesar el archivo subido: "+err.Error(), http.StatusBadRequest)
 		return
 	}
+
+	// Extrae el archivo subido
+	file, handler, err := r.FormFile("file")
+	if err != nil {
+		http.Error(w, "Error al procesar el archivo subido: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	defer file.Close()
+
+	// Extrae el tipo de codificación
+	blockSizeStr := r.FormValue("tipoCod")
+	blockSize, err := strconv.Atoi(blockSizeStr)
+	if err != nil {
+		http.Error(w, "Error al convertir el tamaño de bloque: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	// Extrae el error
+	errorStr := r.FormValue("error")
+	error := false
+	if errorStr == "Si" {
+		error = true
+	}
+
+	// Crea la carpeta "files" si no existe
+	os.Mkdir("files", os.ModePerm)
+
+	// Crea el archivo en el servidor
+	//Aqui deberiamos cambiar el tipo de archivo dependiendo el tipo de codificacion
+	f, err := os.Create(filepath.Join("files", "archivo.txt"))
+	if err != nil {
+		http.Error(w, "No se pudo crear el archivo en el servidor", http.StatusInternalServerError)
+		return
+	}
+	defer f.Close()
+
+	// Copia el contenido del archivo subido al archivo en el servidor
+	if _, err := io.Copy(f, file); err != nil {
+		http.Error(w, "No se pudo guardar el archivo en el servidor", http.StatusInternalServerError)
+		return
+	}
+
+	// Aplicar Hamming
 	var parityBits int
 	var infoBits int
 	switch blockSize {
@@ -61,30 +140,93 @@ func main() {
 		parityBits = bitsParity65536
 		infoBits = bitsInfo65536
 	default:
-		fmt.Print("Error")
+		http.Error(w, "El tamaño de bloque es inválido", http.StatusBadRequest)
+		return
 	}
-	// STRING
-	str := readFile("archivo.txt") //Leemos el archivo y guardamos en string
-	fmt.Println(str)
-	fmt.Println("***************************************")
-	// SLICE
-	slice := []byte(str) //Convertimos string a byte
-	fmt.Println("***************************************")
 
-	bits := modules.ByteToBits(slice, blockSize) //convertimos bytes a bits
-	encode := modules.AplicandoHamming(bits, blockSize, parityBits, infoBits)
+	// Leer el contenido del archivo
+	contenido, err := ioutil.ReadFile(filepath.Join("files", handler.Filename)) //handler.Filename tendrá "archivo.txt"
+	if err != nil {
+		http.Error(w, "No se pudo leer el archivo subido", http.StatusInternalServerError)
+		return
+	}
 
-	ascii := modules.BinToASCII(encode) //convertimos el resultado a texto
-	fmt.Println(ascii)                  // y lo mostramos
+	// Convertir el contenido a bits y aplicar Hamming
+	bits := modules.ByteToBits(contenido, blockSize)
+	encode := modules.AplicandoHamming(bits, blockSize, parityBits, infoBits, error)
 
-	_ = writeFile("codificado.txt", ascii) //EScribimos el resultado en el archivo
+	// Convertir el resultado a texto y escribirlo en un archivo
+	ascii := modules.BinToASCII(encode)
+	if err := ioutil.WriteFile(filepath.Join("files", "codificado.txt"), []byte(ascii), 0644); err != nil {
+		http.Error(w, "No se pudo guardar el archivo codificado", http.StatusInternalServerError)
+		return
+	}
 
-	fmt.Println("***************************************")
-	fmt.Println("Decodificacion:")
+	// Decodificar el contenido y escribirlo en un archivo
 	decode := modules.DecodeHamming(encode, blockSize, infoBits)
 	asciiDeco := modules.BitsToByte(decode)
 	decoded := string(asciiDeco)
-	fmt.Println(decoded)
-	_ = writeFile("decodificado.txt", decoded[:len(str)])
+	if err := ioutil.WriteFile(filepath.Join("files", "decodificado.txt"), []byte(decoded[:len(contenido)]), 0644); err != nil {
+		http.Error(w, "No se pudo guardar el archivo decodificado", http.StatusInternalServerError)
+		return
+	}
+	fmt.Println("***************************************************")
+	fmt.Println(bits[:infoBits]) // Texto a codificar
+	fmt.Println("***************************************************")
+	fmt.Println(encode[:blockSize]) // Codificacion
+	fmt.Println("***************************************************")
+	fmt.Println(modules.GenerarErrorEnbloque(encode[:blockSize])) // Error en codificacion
+	fmt.Println("***************************************************")
 
+	// Servir el archivo HTML con los resultados
+	http.HandlerFunc(mostrarResultados).ServeHTTP(w, r)
+
+}
+
+func mostrarResultados(w http.ResponseWriter, _ *http.Request) {
+
+	// Establecer el tipo de contenido para que se muestre en utf-8 (igual loas acentos no los muestra bien)
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+
+	// Leer el archivo original
+	contenido, err := ioutil.ReadFile(filepath.Join("files", "archivo.txt"))
+	if err != nil {
+		http.Error(w, "No se pudo leer el archivo ", http.StatusInternalServerError)
+		return
+	}
+
+	// Leer el archivo codificado
+	codificado, err := ioutil.ReadFile(filepath.Join("files", "codificado.txt"))
+	if err != nil {
+		http.Error(w, "No se pudo leer el archivo codificado", http.StatusInternalServerError)
+		return
+	}
+
+	// Leer el archivo decodificado
+	decodificado, err := ioutil.ReadFile(filepath.Join("files", "decodificado.txt"))
+	if err != nil {
+		http.Error(w, "No se pudo leer el archivo decodificado", http.StatusInternalServerError)
+		return
+	}
+
+	// Crear un mapa de datos para la plantilla HTML
+	data := map[string]string{
+		"Contenido":    string(contenido),
+		"Codificado":   string(codificado),
+		"Decodificado": string(decodificado),
+	}
+
+	// Leer la plantilla HTML
+	tmpl, err := template.ParseFiles("resultados/resultados.html")
+	if err != nil {
+		http.Error(w, "No se pudo leer la plantilla HTML", http.StatusInternalServerError)
+		return
+	}
+
+	// Pasar los datos a la plantilla HTML
+	err = tmpl.Execute(w, data)
+	if err != nil {
+		http.Error(w, "No se pudo procesar la plantilla HTML", http.StatusInternalServerError)
+		return
+	}
 }
